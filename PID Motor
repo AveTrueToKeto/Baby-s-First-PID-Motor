@@ -1,0 +1,413 @@
+/*
+   Serial interface
+   works with CoolTerm 8n1
+   works with default arduino IDE serial monitor
+*/
+
+/* Connection diagram
+
+  Atmega328p      Romeo           Encoder             Component
+
+  PD2             B2              Encoder A           Encoder A
+  PD3             D3              Encoder B           Encoder B
+  VCC                                                 VCC
+  GND                                                 GND
+  M2              M2-                                 Motor
+  M1              M1+                                 Motor
+*/
+
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#include <util/delay.h>
+#include <stdio.h>
+#define F_CPU 16000000UL
+
+volatile int32_t msCount;
+volatile int32_t printCounter;
+volatile int32_t count = 0;
+volatile int32_t PIDCounter;
+volatile uint8_t A_prev = 0;
+volatile uint8_t A;
+volatile uint8_t B;
+volatile uint8_t runPID;
+volatile float speedO = 0;
+
+volatile int E2 = 6; //Motor 1 Speed Control
+volatile int M2 = 7; //Motor 1 Direction Control
+
+void delay_ms (uint16_t ms);
+void initInterrupts(void);
+void initUART(void);
+void transmitByte (unsigned char data);//transmit Byte to serial terminal
+void transmitString(char* StringPtr);
+void printCount(signed int val);
+void printSpeed();
+void delay_ms();
+void initPowerControl();
+void controlWheel();
+void oscillateSpeed(float speedO);
+void initPIDTimer();
+float PWMVal;
+float PID(float error, float kp, float kd, float ki);
+
+//INT1 interrupt
+ISR(INT0_vect )
+{
+  A = ((PIND) & (0b00000100));
+  B = ((PIND) & (0b00001000));
+
+  if ((A == 0) && (B != 0)) //If A == 0 and B == 1
+  {
+    if (A_prev == 0) /*If previous A value == 0*/
+    {
+      count++; /*Clockwise rotation*/
+    }
+    else
+    {
+      count--;
+    }
+    A_prev = 0; //Set current A value
+  }
+  if ((A != 0) && (B != 0)) //If A == 1 and B == 1
+  {
+    if (A_prev == 0) /*If previous A value == 0*/
+    {
+      count++; /*Clockwise rotation*/
+    }
+    else
+    {
+      count--;
+    }
+    A_prev = 1; //Set current A value
+  }
+  if ((A != 0) && (B == 0)) //If A == 1 and B == 0
+  {
+    if (A_prev == 1) /*If previous A value == 0*/
+    {
+      count++; /*Clockwise rotation*/
+    }
+    else
+    {
+      count--;
+    }
+    A_prev = 1; //Set current A value
+  }
+  if ((A == 0) && (B == 0)) //If A == 0 and B == 0
+  {
+    if (A_prev == 1) /*If previous A value == 0*/
+    {
+      count++; /*Clockwise rotation*/
+    }
+    else
+    {
+      count--;
+    }
+    A_prev = 0; //Set current A value
+  }
+}
+//INT1 interrupt
+ISR(INT1_vect ) {
+  A = ((PIND) & (0b00000100));
+  B = ((PIND) & (0b00001000));
+
+  if ((A != 0) && (B != 0)) //If A == 1 and B == 1
+  {
+    if (A_prev == 1) /*If previous A value == 0*/
+    {
+      count--;
+    }
+    else
+    {
+      count++;
+    }
+    A_prev = 1; //Set current A value
+  }
+  if ((A == 0) && (B != 0)) //If A == 0 and B == 1
+  {
+    if (A_prev == 1)
+    {
+      count--;
+    }
+    else
+    {
+      count++;
+    }
+    A_prev = 0; //Set current A value
+  }
+  if ((A == 0) && (B == 0)) //If A == 0 and B == 0
+  {
+    if (A_prev == 0)
+    {
+      count--;
+    }
+    else
+    {
+      count++;
+    }
+    A_prev = 0; //Set current A value
+  }
+  if ((A != 0) && (B == 0)) //If A == 1 and B == 0
+  {
+    if (A_prev == 0) /*If previous A value == 0*/
+    {
+      count--;
+    }
+    else
+    {
+      count++;
+    }
+    A_prev = 1; //Set current A value
+  }
+}
+ISR(TIMER2_COMPA_vect) {
+  msCount++;
+  PIDCounter++;
+  printCounter++;
+}
+
+int main(void) {
+
+  initUART(9600, 1);
+  initPowerControl();
+  initInterrupts();
+  initPIDTimer();
+
+  DDRD |= (1 << E2) | (1 << M2); // motor control pins output
+  PORTD |= (1 << M2);
+
+  int32_t old_count = 0;
+  float kp = 0.5;
+  float kd = 0;
+  float ki = 0;
+  float u;
+  float error = 0;
+  float target = 0;
+  float wheelAngle;
+  float pwm;
+
+  count = 0;
+  //oscillateSpeed(speedO); //Testing the wheel operation, finding stiction values
+
+  while (1) {
+    /*if (count != old_count) {//Prints count if it has changed needed for encoder test
+      printCount(count);
+      old_count = count;
+      }*/
+    float whileCount;
+
+    if (PIDCounter >= 10) {
+      wheelAngle = calcWheelAngle(count);
+      u = PID(target, wheelAngle, kp, kd, ki);//300 = 90 degrees in this case
+      pwm = controlWheel(u);
+      PIDCounter = 0;
+      runPID = 1;
+    }
+    if ((printCounter >= 50) && (runPID == 0)) {
+
+      transmitString("Degrees ");//Debug code
+      printSpeed(wheelAngle);//Debug code
+
+      transmitString("Encoder ");//Debug code
+      printCount(count);//Debug code
+
+      transmitString("PWM ");//Debug code
+      printSpeed(pwm);
+
+      transmitString("Target Degrees ");//Debug code
+      printSpeed(target);//Debug code
+
+      transmitString("Target Encoder ");//Debug code
+      printSpeed(target * 3.333 * 1.6); //Debug code
+
+      printCounter = 0;
+    }
+    else if (msCount >= 3000) {
+      msCount = 0;
+      target += 90;
+    }
+  }
+}
+void printCount(signed int val) {//This is for printing the encoder value multiplied by the gear ratio 1.6
+  val = val * 1.6;
+  char stringA[100]; //Character array of size 12
+  sprintf(stringA, "%d\r\n", val);
+  transmitString(stringA);
+}
+void printSpeed(signed int val) {//This is for testing the actual input to motor when finding stiction
+  val = val;
+  char stringA[100]; //Character array of size 12
+  sprintf(stringA, "%d\r\n", val);
+  transmitString(stringA);
+}
+void transmitByte (unsigned char data) {
+  while ( !(UCSR0A & (1 << UDRE0)) );
+  // Wait for empty transmit buffer
+
+  UDR0 = data;
+  // Start transmission by writing to UDR0 register
+}
+// print each char in string stopping at null
+void transmitString(char* StringPtr) {
+  while (*StringPtr != 0x00) {
+    transmitByte(*StringPtr);
+    StringPtr++;
+  }
+}
+/*
+  Initialize settings for uart functions.
+  Must be done once at the beginning of the program.
+*/
+void initUART(unsigned int baud, unsigned int speed) {
+  unsigned int ubrr;
+  //Normal mode or double mode UBRR formula
+  if (speed == 0) {
+    ubrr = F_CPU / 16 / baud - 1;
+  } else {
+    ubrr = F_CPU / 8 / baud - 1;
+    UCSR0A = (1 << U2X0);
+  }
+  UBRR0H = (unsigned char) (ubrr >> 8);
+  // shift MSB and store in UBRR0H
+  UBRR0L = (unsigned char) ubrr;
+  // store LSB in UBRR0L
+  UCSR0B = (1 << RXEN0) | (1 << TXEN0);
+  // Enable transmitter/receiver full duplex
+  UCSR0C = (1 << UCSZ00) | (1 << UCSZ01);
+  //8-Bit Characters, 0 Stop bits, No parity
+}
+void delay_ms (uint16_t ms) {
+  uint16_t i;
+  for (i = 0; i < ms; i++)
+    _delay_ms(1);
+
+}
+/*
+  Initialize interrupt settings.
+  Must be done once at the beginning of the program
+*/
+void initInterrupts() {
+  DDRD &= ~ (1 << PD2);       /* PD2 and PD3 as input */
+  DDRD &= ~ (1 << PD3);
+
+  //set INT0 and INT1 for detection of any logical changes of signal
+  //for channels A & B.
+  EICRA |= (1 << ISC10) | (1 << ISC00);
+
+  //Enable INT0 and INT1.
+  EIMSK |= (1 << INT0) | (1 << INT1);
+
+
+  /* enable interrupts */
+  sei();
+  //Must be executed to Set enable interrupts
+}
+void initPowerControl(void) {
+
+  TCCR0A |= (1 << COM0B1) | (1 << COM0A1) |  (1 << WGM01)  |  (1 << WGM00);
+  //Clear OCB01 on output match, non-inverting mode, fast PWM
+
+  TCCR0B =  (1 << CS00);
+
+  TCNT0 = 0;
+  //Set timer to 0 initially
+  OCR0A = 0;
+  //Set OCR0A to 255
+}
+void initPIDTimer() {
+  TCCR2A = (1 << WGM21);
+  //Set CTC mode, normal operation on digital pins
+
+  TCCR2B = (1 << CS22);
+  //Set divider to 64
+
+  TIMSK2 = (1 << OCIE2A);
+  //Set to interrupt on match with OCR2A
+
+  //TIMSK2 = (1 << OCIE2B);
+  //Set to interrupt on match with OCR2A
+
+  OCR2A = 250;
+  //Set Compared Output value
+}
+float controlWheel(float value) {
+  float absValue;
+  float absValuePrint;
+
+  if (value > 0) {
+    PORTD &= ~(1 << M2); // forward
+    absValue = value;
+  } else if (value < 0) {
+    PORTD |= (1 << M2);  // reverse
+    absValue = -value;
+  }
+
+  if (absValue  > -0.5 && absValue < 0.5) {
+    absValue = 0;
+  } else {
+    absValue = mapdata(absValue, 0.0, 255.0, 23, 75.0); // mapping
+  }
+
+  OCR0A = (uint8_t) absValue;
+
+  absValuePrint = (absValue * 100) / 255;
+
+  return absValuePrint;;
+}
+float PID(float target, float sensor, float kp, float kd, float ki) {
+  float Porp;
+  float Deri;
+  float Inte;
+  float PDV;
+  float previous_error;
+  float inte_prev;
+  float error;
+
+  error = target - sensor;
+  Porp = error;
+
+  Deri = (error - previous_error);
+  Inte = Inte + error;
+
+
+  PDV = (kp * Porp) + (kd * Deri) + (ki * Inte);
+  //Control Eq
+
+  previous_error = error;
+
+  //var names self explanatory
+  return PDV;
+}
+void oscillateSpeed(float speedO) {//This function is testing the speed output for finding the correct stiction value
+  while (1) {
+
+    for (speedO = -100; speedO <= 100; speedO++) {
+      if (speedO == 0) {
+        speedO += 22;
+      }
+      controlWheel(speedO);
+      printSpeed(speedO);
+      delay_ms(500);
+    }
+    for (speedO = 100; speedO >= -100; speedO--) {
+      if (speedO == 0) {
+        speedO -= 22;
+      }
+      controlWheel(speedO);
+      printSpeed(speedO);
+
+      delay_ms(1000);
+    }
+  }
+}
+// map a number from range a,b to range c,d
+float mapdata(float v, float a, float b, float c, float d) {
+  return ((v - a) * (d - c) / (b - a)) + c;
+}
+float calcWheelAngle(uint32_t count) {
+  float Angle;
+  float input = count;
+
+  Angle = (input / 3.333);
+
+  return Angle;
+}
